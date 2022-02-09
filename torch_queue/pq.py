@@ -1,22 +1,19 @@
 import torch
 
-def merge(a, b):
+def merge(a, b, av, bv):
     n = a.shape[-1]
+    B = a.shape[0]
+    Bs = torch.arange(B).view(-1, 1)
     ordera = torch.searchsorted(a, b) + torch.arange(n)
     orderb = torch.searchsorted(b, a, right=True) + torch.arange(n)
     out = torch.zeros(a.shape[:-1] + (a.shape[-1] + b.shape[-1], ))
-    out[..., ordera] = b
-    out[..., orderb] = a
-    return out[..., :a.shape[-1]], out[..., a.shape[-1]:]
+    out[Bs, ordera] = b
+    out[Bs, orderb] = a
+    outv = torch.zeros(a.shape[:-1] + (a.shape[-1] + b.shape[-1], )).long()
+    outv[Bs, ordera] = bv
+    outv[Bs, orderb] = av
+    return out[..., :a.shape[-1]].contiguous(), out[..., a.shape[-1]:].contiguous(), outv[..., :a.shape[-1]], outv[..., a.shape[-1]:]
 
-def test_merge():
-    out_a, out_b = merge(torch.tensor([1., 2, 5]), torch.tensor([1., 4, 6]))
-    assert out_a.tolist() == [1, 1, 2]
-    assert out_b.tolist() == [4, 5, 6]
-    out_a, out_b = merge(torch.tensor([[1., 2, 5], [1., 4, 6]]),
-                         torch.tensor([[1., 4, 6], [1., 2, 5]]))
-    assert out_a[1].tolist() == [1, 1, 2]
-    assert out_b[1].tolist() == [4, 5, 6]
 
 def make_path(index):
     order = "{0:b}".format(index + 1)
@@ -25,6 +22,137 @@ def make_path(index):
     for i in range(1, len(order)):
         out.append(order[i] + 2 * out[-1])
     return torch.tensor(out) - 1
+        
+class Heap:
+    def __init__(self, group_size, total_size, batch=1):
+        self.size = 0
+        self.storage = torch.zeros(batch, total_size, group_size)
+        self.storage.fill_(1.e9)
+        self.values = torch.zeros(batch, total_size, group_size).long()
+        self.lengths = torch.zeros(batch, total_size)
+        self.batch = batch
+        
+    def insert_heapify(self, items, values, pos, order):
+        node_id = order[pos]
+        head = self.storage[:, node_id]
+        hvalues = self.values[:, node_id]
+        # self.lengths[:, node_id] = items.shape[0]
+        if pos == order.shape[0] - 1:
+            head[:] = items
+            self.values[:, node_id, :] = values
+        else:
+            
+            head[:], items[:], hvalues[:], values[:] = \
+                merge(head, items, hvalues, values)
+            self.insert_heapify(items, values, pos+1, order)
+        
+    def insert(self, items, values, sorted=False):
+        if not sorted:
+            items, order = torch.sort(items)
+            values = values[order]
+        self.insert_heapify(items, values, 0, make_path(self.size))
+        self.size = self.size + 1
+        
+    def delete_heapify(self, node_ids):
+        if (node_ids >= self.size).any():
+            return
+        Bs = torch.arange(self.batch)
+        c = torch.stack(((node_ids + 1) * 2 - 1 , (node_ids + 1) * 2), dim=1)
+        top = self.storage[Bs, node_ids]
+        topv = self.values[Bs, node_ids]
+        c_l = self.storage[Bs, c[:, 0]]
+        c_r = self.storage[Bs, c[:, 1]]
+        c_lv = self.values[Bs, c[:, 0]]
+        c_rv = self.values[Bs, c[:, 1]]
+        ins = torch.where(c_l[..., -1] < c_r[..., -1], 0, 1)
+        s, l = c[Bs, ins], c[Bs, 1-ins]
+        small, self.storage[Bs, l, :], \
+            smallv, self.values[Bs, l, :]  = \
+            merge(c_l, c_r, c_lv, c_rv)
+        self.storage[Bs, node_ids, :], self.storage[Bs, s, :], \
+            self.values[Bs, node_ids, :], self.values[Bs, s, :] = \
+            merge(top, small.contiguous(), topv, smallv)
+        self.delete_heapify(s)
+
+    def delete_min(self):
+        items = self.storage[:, 0].clone()
+        values = self.values[:, 0].clone()
+        if self.size == 1:
+            self.storage[:, 0] = 1.e9
+            self.values[:, 0] = -1
+            return items, values
+        path = make_path(self.size-1)
+        self.storage[:, 0, :] = self.storage[:, path[-1]]
+        self.values[:, 0, :] = self.values[:, path[-1]]
+        self.storage[:, path[-1]] = 1.e9
+        self.values[:, path[-1]] = -1
+        self.delete_heapify(torch.zeros(self.batch).long())
+        self.size = self.size - 1
+        return items, values
+
+
+import hypothesis
+from hypothesis import example, given, strategies as st
+
+
+@given(st.lists(st.lists(st.integers(min_value=-50, max_value=50), min_size=32, max_size=32), min_size=1, max_size=2))
+@example([[1,2,3,4], [4,5,3,4]])
+def test_sort(ls):
+    ls2 = [list(sorted(l)) for l in ls]
+    size = len(ls[0])
+    group = 2
+    batch = len(ls)
+    heap = Heap(group, size, batch)
+    for i in range(size//group):
+        x = torch.tensor([l[i*group:(i+1)*group] for l in ls]).float()
+        x, _ = x.sort(dim=-1)
+        x = x.view(batch, group)
+        print(x)
+        heap.insert(x, x.long())
+        print(heap.storage)
+    ks, vs = [], []
+    for j in range(size // group):
+        k, v = heap.delete_min()
+        ks.append(k)
+        vs.append(v)
+    print(ks)
+    for b in range(batch):
+        ls = []
+        lsv = []
+        for j in range(size // group):
+            ls += ks[j][b].tolist()
+            lsv += vs[j][b].tolist()
+    
+        for j in range(1, len(ls)):
+            assert ls[j] >= ls[j - 1]
+            assert ls2[b][j] == ls[j]
+            assert ls[j] == lsv[j]
+
+
+
+def test_head():
+    heap = Heap(4, 16, batch=1)
+    x = torch.arange(4).view(1, 4)
+
+    
+def test_merge():
+    out_a, out_b, av, bv = merge(torch.tensor([[1., 2, 5]]), torch.tensor([[1., 4, 6]]),
+                                 torch.tensor([[1, 2, 5]]), torch.tensor([[1, 4, 6]]))
+    
+    assert out_a.tolist() == [[1, 1, 2]]
+    assert out_b.tolist() == [[4, 5, 6]]
+    assert av.tolist() == [[1, 1, 2]]
+    assert bv.tolist() == [[4, 5, 6]]
+    out_a, out_b, av, bv = merge(torch.tensor([[1., 2, 5], [1., 4, 6]]),
+                         torch.tensor([[1., 4, 6], [1., 2, 5]]),
+                         torch.tensor([[1, 2, 5], [1, 4, 6]]),
+                         torch.tensor([[1, 4, 6], [1, 2, 5]])
+    )
+    assert out_a[1].tolist() == [1, 1, 2]
+    assert out_b[1].tolist() == [4, 5, 6]
+    assert av[1].tolist() == [1, 1, 2]
+    assert bv[1].tolist() == [4, 5, 6]
+
 
 def test_path():
     # assert make_path(0) == []
@@ -33,119 +161,3 @@ def test_path():
     assert make_path(3).tolist() == [0, 1, 3]
     assert make_path(4).tolist() == [0, 1, 4]
     assert make_path(5).tolist() == [0, 2, 5]
-        
-# def insert_heapify(items, pos, order, node):
-#     if node is None:
-#         return [items, [None, None]]
-#     head, c = node
-#     new_head, new_items = merge(head, items)
-#     if order[pos] == "0":
-#         c[0] = insert_heapify(new_items, pos+1, order, c[0])
-#     else:
-#         c[1] = insert_heapify(new_items, pos+1, order, c[1])
-#     return [new_head, c]
-
-
-
-
-def children(index):
-    return (index * 2, index * 2 + 1)
-
-
-class Heap:
-    def __init__(self, group_size, total_size):
-        self.size = 0
-        self.storage = torch.zeros(1, total_size, group_size)
-        self.lengths = torch.zeros(1, total_size)
-        
-    def insert_heapify(self, items, pos, order):
-        node_id = order[pos]
-        head = self.storage[:, node_id]
-        if self.lengths[0, node_id] == 0:
-            assert(pos == order.shape[0] - 1)
-            self.lengths[0, node_id] = items.shape[0]
-            head[:] = items
-        else:
-            head[:], items[:] = merge(head, items)
-            self.lengths[0, node_id] = items.shape[0]
-            self.insert_heapify(items, pos+1, order)
-
-        
-    def insert(self, items):
-        if self.lengths[0, 0] == 0:
-            self.storage[0, 0, :] = items
-            self.lengths[0, 0] = items.shape[0]
-            self.size = self.size + 1
-        else:
-            path = make_path(self.size)
-            self.insert_heapify(items, 0, path)
-            self.size = self.size + 1
-
-    def delete_heapify(self, node_id):
-        c = children(node_id)
-        if self.lengths[0, c[0]] == 0 or self.lengths[0, node_id] == 0:
-            return
-        
-        head = self.storage[0, node_id]
-        c_l = self.storage[0, c[0]]
-        if self.lengths[0, c[1]] == 0:
-            head[:], c_l[:] = merge(head, c_l)
-        else:
-            c_r = self.storage[0, c[1]]
-            s, l = (c[0], c[1]) if c_l[-1] < c_r[-1] else (c[1], c[0])
-            small, self.storage[0, l, :] = merge(c_l, c_r)
-            head[:], self.storage[0, s, :] = merge(head, small)
-            self.delete_heapify(s)
-
-    def delete_min(self):
-        items = self.storage[:, 0].clone()
-        if self.size == 1:
-            self.storage[:, 0] = 0
-            self.lengths[:, 0] = 0
-            return items
-        path = make_path(self.size-1)
-        self.storage[:, 0, :] = self.storage[:, path[-1]]
-        self.storage[:, path[-1]] = 0.0
-        self.lengths[:, path[-1]] = 0
-        self.delete_heapify(0)
-        self.size = self.size - 1
-        return items
-        
-    # def insert2(self, items):
-    #     if self.top is None:
-    #         self.top = (items, [None, None])
-    #         return
-    #     order = "{0:b}".format(self.size)
-    #     self.top = insert_heapify(items, 0, order, self.top)
-    #     self.size = self.size + 1
-        
-    # def delete_min(self):
-    #     if self.size == 0:
-    #         return self.top[0]
-    #     ret, _ = self.top
-    #     order = "{0:b}".format(self.size-1)
-    #     cur = self.top
-    #     for i in range(len(order)):
-    #         _, c = cur
-    #         parent = cur
-    #         cur = c[int(order[i])]
-
-    #     head, c = self.top
-    #     self.top = [cur[0], c]
-    #     parent[1][int(order[i])] = None
-    #     self.size = self.size - 1
-    #     self.top = delete_heapify(self.top)
-    #     return ret
-
-
-def test_head():
- 
-    heap = Heap(4, 16)
-    x = torch.arange(4)
-    heap.insert(torch.tensor([[1, 2, 3, 4]]))
-    for i in range(5):
-        heap.insert(x * 5 + float(i))
-    print(heap.storage)
-    for i in range(5):
-        print(heap.delete_min())
-    assert(False)
