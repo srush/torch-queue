@@ -1,6 +1,10 @@
 import torch
 
 def merge(a, b, av, bv):
+    """
+    Merge two sorted key tensors `a` and `b` as well as corresponding 
+    int value tensors `av` and `bv`
+    """
     n = a.shape[-1]
     B = a.shape[0]
     Bs = torch.arange(B).view(-1, 1)
@@ -16,6 +20,9 @@ def merge(a, b, av, bv):
 
 
 def make_path(index):
+    """
+    Given a size of a node to add get the binary path to reach it.
+    """
     order = "{0:b}".format(index + 1)
     order = torch.tensor(list(map(int, order)))
     out = [1]
@@ -25,6 +32,11 @@ def make_path(index):
         
 class Heap:
     def __init__(self, group_size, total_size, batch=1):
+        """
+        Create a heap over vectors of `group_size` that 
+        can expand to `group_size * total_size` nodes with 
+        independent `batch`es.
+        """
         self.size = 0
         self.storage = torch.zeros(batch, total_size, group_size)
         self.storage.fill_(1.e9)
@@ -33,6 +45,7 @@ class Heap:
         self.batch = batch
         
     def insert_heapify(self, items, values, pos, order):
+        "Internal"
         node_id = order[pos]
         head = self.storage[:, node_id]
         hvalues = self.values[:, node_id]
@@ -46,10 +59,15 @@ class Heap:
                 merge(head, items, hvalues, values)
             self.insert_heapify(items, values, pos+1, order)
         
-    def insert(self, items, values, sorted=False):
+    def insert(self, keys, values, sorted=False):
+        """
+        Insert a batch of group_size keys `keys`  with corresponding 
+        integer `values`.
+        """
+        items = keys
         if not sorted:
-            items, order = torch.sort(items)
-            values = values[order]
+            items, order = torch.sort(items, dim=-1)
+            values = values[:, order]
         self.insert_heapify(items, values, 0, make_path(self.size))
         self.size = self.size + 1
         
@@ -75,6 +93,9 @@ class Heap:
         self.delete_heapify(s)
 
     def delete_min(self):
+        """
+        Pop and delete a batch of group_size keys and values.
+        """
         items = self.storage[:, 0].clone()
         values = self.values[:, 0].clone()
         if self.size == 1:
@@ -91,6 +112,8 @@ class Heap:
         return items, values
 
 
+# TESTS
+    
 import hypothesis
 from hypothesis import example, given, strategies as st
 
