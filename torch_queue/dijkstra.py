@@ -88,5 +88,3 @@ for x in edges.grad.nonzero():
 nx.draw_networkx_edges(G, pos, width=10.0, edgelist=d.keys(), edge_color="red")
 plt.tight_layout()
 plt.savefig("Graph.png", format="PNG")
-
-
