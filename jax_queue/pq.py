@@ -60,37 +60,31 @@ def insert(key_store, val_store, size, max_size, keys, values):
     integer `values`.
     """
     path = make_path(size, max_size)
-    out, _ = jax.lax.scan(insert_heapify, (key_store, val_store, keys, values), path)
-    key_store, val_store, keys, values = out
-    size = size + 1
-    return key_store, val_store, size
+    def insert_heapify(state, n):
+        key_store, val_store, keys, values = state
+        head, keys, hvalues, values = merge(
+            key_store[n], keys, val_store[n], values
+        )
+        return (key_store.at[n].set(head), val_store.at[n].set(hvalues),
+                keys, values), None
 
-def insert_heapify(state, n):
-    "Internal"
-    key_store, val_store, keys, values = state
-    head, keys, hvalues, values = merge(
-        key_store[n], keys, val_store[n], values
-    )
-    key_store = key_store.at[n].set(head)
-    val_store = val_store.at[n].set(hvalues)
-    return (key_store, val_store, keys, values), None
+    (key_store, val_store, keys, values), _ = \
+        jax.lax.scan(insert_heapify, (key_store, val_store, keys, values), path)
+    return key_store, val_store, size + 1
 
 @partial(jax.jit, static_argnums=1)
 def delete_min(heap, msize):
-    """
-    Pop and delete a batch of group_size keys and values.
-    """
     key_store, val_store, size = heap
     keys = key_store[0]
     values = val_store[0]
-
     def one():
         return key_store.at[0].set(INF), val_store.at[0].set(-1)
     def two():
         path = make_path(size - 1, msize)
         key_store2 = key_store.at[0].set(key_store[path[-1]]).at[path[-1]].set(INF)
         val_store2 = val_store.at[0].set(val_store[path[-1]]).at[path[-1]].set(-1)
-        key_store3, val_store3, n =  jax.lax.fori_loop(0, msize, delete_heapify, (key_store2, val_store2, 0))
+        key_store3, val_store3, n = \
+            jax.lax.fori_loop(0, msize, delete_heapify, (key_store2, val_store2, 0))
         return key_store3, val_store3
     key_store, val_store = jax.lax.cond((size == 1).all(), one, two)
     size = size - 1
@@ -99,26 +93,15 @@ def delete_min(heap, msize):
 def delete_heapify(_, state):
     key_store, val_store, n = state
     c = np.stack(((n + 1) * 2 - 1, (n + 1) * 2))
-    top = key_store[n]
-    topv = val_store[n]
-    c_l = key_store[c[0]]
-    c_r = key_store[c[1]]
-    c_lv = val_store[c[0]]
-    c_rv = val_store[c[1]]
+    c_l,c_r = key_store[c[0]], key_store[c[1]]
+    c_lv, c_rv = val_store[c[0]], val_store[c[1]]
     ins = np.where(c_l[-1] < c_r[-1], 0, 1)
     s, l = c[ins], c[1 - ins]
-
     small, k2, smallv, v2 = merge(c_l, c_r, c_lv, c_rv)
-    key_store = key_store.at[l].set(k2)
-    val_store = val_store.at[l].set(v2)
-
-    k1, k2, v1, v2 = merge(top, small, topv, smallv)
-    key_store = key_store.at[n].set(k1)
-    val_store = val_store.at[n].set(v1)
-    key_store = key_store.at[s].set(k2)
-    val_store = val_store.at[s].set(v2)
+    k1, k2, v1, v2 = merge(key_store[n], small, val_store[n], smallv)
+    key_store = key_store.at[l].set(k2).at[n].set(k1).at[s].set(k2)
+    val_store = val_store.at[l].set(v2).at[n].set(v1).at[s].set(v2)
     return key_store, val_store, s
-
 
 # TESTS
 
