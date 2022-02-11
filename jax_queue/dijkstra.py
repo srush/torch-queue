@@ -12,21 +12,21 @@ INF = np.array(1.0e5)
 nodes = np.zeros((SIZE + BLOCK_SIZE, 2))
 nodes[:SIZE, 1] = -(np.arange(SIZE) / SIZE)
 parabola = (np.arange(SIZE) / SIZE) - 0.5
-nodes[:SIZE, 0] = ((np.rand(SIZE) - 0.5) / 4.0) + (0.5 - (parabola * parabola))
-nodes[0] = np.tensor([0.25, 0.1])
-nodes[SIZE - 1] = np.tensor([0.25, -1.1])
+nodes[:SIZE, 0] = ((np.random.rand(SIZE) - 0.5) / 4.0) + (0.5 - (parabola * parabola))
+nodes[0] = np.array([0.25, 0.1])
+nodes[SIZE - 1] = np.array([0.25, -1.1])
 distance = nodes[:, None, :] - nodes[None, :, :]
-edges = (distance * distance).sum(-1).sqrt() + torch.eye(SIZE + BLOCK_SIZE) * INF
+edges = np.sqrt((distance * distance).sum(-1)) + np.eye(SIZE + BLOCK_SIZE) * INF
 edges[:, -BLOCK_SIZE:] = INF
 for i in range(SIZE + BLOCK_SIZE):
     edges[i, :i], edges[i, i + BLOCK_SIZE :] = INF, INF
 edges[0, SIZE - 1] = INF
-
+INF = jnp.array(1.0e5)
 
 # Data structures
-def shortest_path(edges):
-    heap, msize = pq.make_heap(BLOCK_SIZE, 2**8)
-    B, L = np.full((BLOCK_SIZE), INF), np.full((1, BLOCK_SIZE), -1)
+def shortest_path(edges, msize):
+    heap = pq.make_heap(BLOCK_SIZE, 2**msize)
+    B, L = jnp.full((BLOCK_SIZE), INF), jnp.full((BLOCK_SIZE), -1, dtype=int)
     B = B.at[0].set(0)
     L = L.at[0].set(0)
     Q = jnp.zeros((SIZE + BLOCK_SIZE))
@@ -34,47 +34,64 @@ def shortest_path(edges):
 
     # Dijkstra
     final = None
-    def inner_loop(heap, B, L, Q, D):
+    def inner_loop(_, args):
+        heap, B, L, Q, D = args
         # Find next node
-        def find_pos(s, heap, B, L):
-            start = np.argwhere(Q[L[0]] == 0, size=1, fill_value=-1)
+        def find_pos(_, args):
+            s, heap, B, L = args
+            start = jnp.argwhere(Q[L] == 0, size=1, fill_value=-1)
             heap, B, L = jax.lax.cond(
-                start[0] == -1,
-                lambda: pq.delete_min(heap, msize),
-                lambda: heap, B, L)
-            return start[0], heap, B, L
-        pos, heap, B, L = jax.while(lambda s: s[0], find_pos, (-1, heap, B, L))
-        l, b = L[pos], B[pos]
-        Q = Q.at[l].set(1.0)
-        D = D.at[l].set(b)
+                pred=(start[0] == -1).all(),
+                true_fun = lambda : pq.delete_min(heap, msize),
+                false_fun = lambda : (heap, B, L))
+            return start.reshape(1)[0], heap, B, L
+        pos, heap, B, L = jax.lax.fori_loop(0, 10, find_pos,
+                                            (-1, heap, B, L))
 
-        # Expand
-        scores = (
-            Q[l : l + BLOCK_SIZE] * INF
-            + b
-            + edges[l, l : l + BLOCK_SIZE]
-        )
-        scores = torch.where(scores < D[l : l + BLOCK_SIZE], scores, INF)
-        indices = torch.arange(l, l + BLOCK_SIZE)
-        heap = pq.insert(heap, msize, scores, indices, sorted=False)
+        def update(args):
+            heap, B, L, Q, D = args
+            l, b = L[pos], B[pos]
+            Q = Q.at[l].set(1.0)
+            D = D.at[l].set(b)
+            # Expand
+            bs = jnp.arange(BLOCK_SIZE)
+            scores = (
+                Q[bs + l] * INF
+                + b
+                + edges[l, bs + l]
+            )
+            scores = jnp.where(scores < D[bs + l], scores, INF)
+            order = np.argsort(scores, kind='stable')
+            heap = pq.insert(*heap, msize, scores[order], (bs+l)[order])
 
-        # Refresh buffer
-        heap, B2, L2 = pq.delete_min(heap, msize)
-        B = B.at[ : -(pos + 1)].set(B[0, pos + 1 :]).at[-(pos + 1) :].set(INF)
-        L = L.at[ : -(pos + 1)].set(L[0, pos + 1 :]).at[-(pos + 1) :].set(-1)
-        B, B2, L, L2 = pq.merge(B, B2, L, L2)
-        heap = pq.insert(heap, msize, B2, L2, sorted=True)
-        return heap, B, L, Q, D
-    heap, B, L, Q, D = jax.while(lambda s: s[3][SIZE-1] == 1,
-                                 inner_loop,
-                                 (heap, B, L, Q, D))
+            # Refresh buffer
+            heap, B2, L2 = pq.delete_min(heap, msize)
+            i = jnp.arange(BLOCK_SIZE)
+            B = jnp.where(i < (BLOCK_SIZE - (pos+1)), jnp.roll(B, -(pos+1)), INF)
+            L = jnp.where(i < (BLOCK_SIZE - (pos+1)), jnp.roll(L, -(pos+1)), -1) 
+            B, B2, L, L2 = pq.merge(B, B2, L, L2)
+            heap = pq.insert(*heap, msize, B2, L2)
+            return heap, B, L, Q, D
+        return jax.lax.cond((pos!=-1).all(), update, lambda x: x, (heap, B, L, Q, D))
+    heap, B, L, Q, D = jax.lax.fori_loop(
+        0, 2*SIZE,
+        inner_loop,
+        (heap, B, L, Q, D))
     return D[SIZE-1]
-path = jax.grad(shortest_path)
-path(jnp.array(edges))
+# path = jax.grad(shortest_path)
+# from jax.config import config
 
+# config.update('jax_disable_jit', True)
+
+# shortest_path(jnp.array(edges), 8)
+path = jax.jit(jax.grad(lambda x: shortest_path(x, 8)))
+out = path(jnp.array(edges))
+print(out)
+# print("done1")
+# out = path(jnp.array(edges))
 # Plot
 plt.figure(figsize=(20, 30))
-edge = edges[:SIZE, :SIZE].cpu().detach().numpy()
+edge = np.array(edges[:SIZE, :SIZE])
 G = nx.from_numpy_matrix(edge * (edge < 100))
 pos = {i: nodes[i].tolist() for i in range(SIZE)}
 nx.draw(
@@ -88,9 +105,12 @@ nx.draw(
     font_weight="bold",
 )
 
+print(np.array(out).nonzero())
 d = {}
-for x in edges.grad.nonzero():
-    d[x[0].item(), x[1].item()] = "x"
+nz = np.array(out).nonzero()
+for i in range(nz[0].shape[0]):
+    d[nz[0][i], nz[1][i]] = "x"
 nx.draw_networkx_edges(G, pos, width=10.0, edgelist=d.keys(), edge_color="red")
 plt.tight_layout()
 plt.savefig("Graph.png", format="PNG")
+

@@ -14,7 +14,7 @@ def merge(a, b, av, bv):
     out = np.zeros((a.shape[-1] + b.shape[-1],))
     out = out.at[ordera].set(b)
     out = out.at[orderb].set(a)
-    outv = np.zeros((a.shape[-1] + b.shape[-1],))
+    outv = np.zeros((a.shape[-1] + b.shape[-1],), dtype=int)
     outv = outv.at[ordera].set(bv)
     outv = outv.at[orderb].set(av)
     return (
@@ -31,8 +31,13 @@ def make_path(index, bits):
     """
     mask = 2**np.arange(bits-1, -1, -1)
     x = np.bitwise_and(np.array(index+1).ravel(), mask) != 0
-    _, x = jax.lax.scan(lambda c, a : (a + 2 * c, a + 2 * c), np.array(1), x[1:])
-    return np.concatenate((np.array([0]), x - 1))
+    def path(c, a):
+        x = a + 2 * c
+        x = np.minimum(x, index+1)
+        return x, x
+
+    _, x = jax.lax.scan(path, np.array([1]), x[1:])
+    return np.concatenate((np.array([0]), (x - 1).reshape(-1)))
 
 
 def make_heap(group_size, total_size):
@@ -44,37 +49,31 @@ def make_heap(group_size, total_size):
     size = np.zeros(1, dtype=int)
     key_store = np.full((total_size, group_size), 1.e5)
     val_store = np.zeros((total_size, group_size), dtype=int)
-    return (key_store, val_store, size), int(np.log2(key_store.shape[0]))
+    return (key_store, val_store, size)
+
+INF = 1.e9
 
 @partial(jax.jit, static_argnums=3)
-def insert(key_store, val_store, size, max_size, keys, values, sorted=False):
+def insert(key_store, val_store, size, max_size, keys, values):
     """
     Insert a batch of group_size keys `keys`  with corresponding
     integer `values`.
     """
-    if not sorted:
-        order = np.argsort(keys)
-        keys = keys[order]
-        values = values[order]
     path = make_path(size, max_size)
-    key_store, val_store = insert_heapify(key_store, val_store, keys, values, 0, path)
+    out, _ = jax.lax.scan(insert_heapify, (key_store, val_store, keys, values), path)
+    key_store, val_store, keys, values = out
     size = size + 1
     return key_store, val_store, size
 
-def insert_heapify(key_store, val_store, keys, values, pos, order):
+def insert_heapify(state, n):
     "Internal"
-    n = order[pos]
-    if pos == order.shape[0] - 1:
-        key_store = key_store.at[n].set(keys)
-        val_store = val_store.at[n].set(values)
-    else:
-        head, keys, hvalues, values = merge(
-            key_store[n], keys, val_store[n], values
-        )
-        key_store = key_store.at[n].set(head)
-        val_store = val_store.at[n].set(hvalues)
-        key_store, val_store = insert_heapify(key_store, val_store, keys, values, pos + 1, order)
-    return key_store, val_store
+    key_store, val_store, keys, values = state
+    head, keys, hvalues, values = merge(
+        key_store[n], keys, val_store[n], values
+    )
+    key_store = key_store.at[n].set(head)
+    val_store = val_store.at[n].set(hvalues)
+    return (key_store, val_store, keys, values), None
 
 @partial(jax.jit, static_argnums=1)
 def delete_min(heap, msize):
@@ -86,23 +85,19 @@ def delete_min(heap, msize):
     values = val_store[0]
 
     def one():
-        return key_store.at[0].set(1.0e9), val_store.at[0].set(-1)
+        return key_store.at[0].set(INF), val_store.at[0].set(-1)
     def two():
         path = make_path(size - 1, msize)
-        key_store2 = key_store.at[0].set(key_store[path[-1]])
-        val_store2 = val_store.at[0].set(val_store[path[-1]])
-        key_store2 = key_store2.at[path[-1]].set(1.0e9)
-        val_store2 = val_store2.at[path[-1]].set(-1)
-        return delete_heapify(key_store2, val_store2, size, msize, 0)
-
-
+        key_store2 = key_store.at[0].set(key_store[path[-1]]).at[path[-1]].set(INF)
+        val_store2 = val_store.at[0].set(val_store[path[-1]]).at[path[-1]].set(-1)
+        key_store3, val_store3, n =  jax.lax.fori_loop(0, msize, delete_heapify, (key_store2, val_store2, 0))
+        return key_store3, val_store3
     key_store, val_store = jax.lax.cond((size == 1).all(), one, two)
     size = size - 1
     return (key_store, val_store, size), keys, values
 
-def delete_heapify(key_store, val_store, size, max_size, n):
-    if (n >= max_size):
-        return key_store, val_store
+def delete_heapify(_, state):
+    key_store, val_store, n = state
     c = np.stack(((n + 1) * 2 - 1, (n + 1) * 2))
     top = key_store[n]
     topv = val_store[n]
@@ -122,32 +117,37 @@ def delete_heapify(key_store, val_store, size, max_size, n):
     val_store = val_store.at[n].set(v1)
     key_store = key_store.at[s].set(k2)
     val_store = val_store.at[s].set(v2)
-    key_store, val_store = delete_heapify(key_store, val_store, size, max_size, s)
-    return key_store, val_store
+    return key_store, val_store, s
 
 
 # TESTS
 
 import hypothesis
 from hypothesis import example, given, strategies as st
+from jax.config import config
+
+
 
 
 @given(
     st.lists(st.integers(min_value=-50, max_value=50), min_size=32, max_size=32)
 )
 def test_sort(ls):
+    config.update('jax_disable_jit', True)
     ls2 = sorted(ls)
     size = len(ls)
     group = 4
     heap = make_heap(group, size)
+    msize = 8
     for i in range(size // group):
         x = np.array(ls[i * group : (i + 1) * group])
         x = x.reshape(group)
-        heap = insert(heap, x, x)
+        x = np.sort(x)
+        heap = insert(*heap, msize, x, x)
 
     ks, vs = [], []
     for j in range(size // group):
-        heap, k, v = delete_min(heap)
+        heap, k, v = delete_min(heap, msize)
         ks.append(k)
         vs.append(v)
     ls = []
@@ -163,22 +163,29 @@ def test_sort(ls):
 
 
 def test_head():
-
-
-    heap, msize = make_heap(4, 16)
-    x = np.array([3, 2,3, 1])
-    heap = insert(*heap, msize, x, x)
-    x = np.array([4, 2,4, 1])
-    heap = insert(*heap, msize, x, x)
-    x = np.array([5, 6,7, 8])
-    heap = insert(*heap, msize, x, x)
-    x = np.array([5, 6,7, 8])
-    heap = insert(*heap, msize, x, x)
+    msize = 10
+    heap = make_heap(4, 2**4)
+    x = np.array([1, 2, 3, 3])
+    heap = insert(*heap, msize, x.astype(float), x)
+    x = np.array([1, 2, 4, 4])
+    heap = insert(*heap, msize, x.astype(float), x)
+    x = np.array([5, 6, 7, 8])
+    heap = insert(*heap, msize, x.astype(float), x)
+    x = np.array([5, 6, 7, 8])
+    heap = insert(*heap, msize, x.astype(float), x)
     heap, k, v = delete_min(heap, msize)
     assert (k == np.array([1, 1, 2, 2])).all()
+    assert (k == v).all()
     heap, k, v = delete_min(heap, msize)
     assert (k == np.array([3, 3, 4, 4])).all()
-
+    assert (k == v).all()
+    heap, k, v = delete_min(heap, msize)
+    print(k)
+    assert (k == np.array([5, 5, 6, 6])).all()
+    assert (k == v).all()
+    heap, k, v = delete_min(heap, msize)
+    assert (k == np.array([7, 7, 8, 8])).all()
+    assert (k == v).all()
 
 def test_merge():
     out_a, out_b, av, bv = merge(
@@ -207,6 +214,7 @@ def test_merge():
 def test_path():
     # assert make_path(0) == []
     assert make_path(1, 2).tolist() == [0, 1]
+    assert make_path(1, 3).tolist() == [0, 1, 1]
     assert make_path(2, 2).tolist() == [0, 2]
     assert make_path(3, 3).tolist() == [0, 1, 3]
     assert make_path(4, 3).tolist() == [0, 1, 4]
