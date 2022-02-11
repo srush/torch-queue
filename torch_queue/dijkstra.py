@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 torch.set_default_tensor_type("torch.cuda.FloatTensor")
 
 # Make Graph
-SIZE, BLOCK_SIZE = 2056, 64
+SIZE, BLOCK_SIZE = 2056, 128
 INF = torch.tensor(1.0e5).float()
 nodes = torch.zeros((SIZE + BLOCK_SIZE, 2))
 nodes[:SIZE, 1] = -(torch.arange(SIZE) / SIZE)
