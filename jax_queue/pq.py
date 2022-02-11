@@ -121,7 +121,7 @@ def delete_heapify(key_store, val_store, size, max_size, n):
     key_store = key_store.at[n].set(k1)
     val_store = val_store.at[n].set(v1)
     key_store = key_store.at[s].set(k2)
-    val_store = val_store.at[s].set(v2)    
+    val_store = val_store.at[s].set(v2)
     key_store, val_store = delete_heapify(key_store, val_store, size, max_size, s)
     return key_store, val_store
 
@@ -144,7 +144,7 @@ def test_sort(ls):
         x = np.array(ls[i * group : (i + 1) * group])
         x = x.reshape(group)
         heap = insert(heap, x, x)
-        
+
     ks, vs = [], []
     for j in range(size // group):
         heap, k, v = delete_min(heap)
@@ -163,8 +163,8 @@ def test_sort(ls):
 
 
 def test_head():
-    
-    
+
+
     heap, msize = make_heap(4, 16)
     x = np.array([3, 2,3, 1])
     heap = insert(*heap, msize, x, x)
