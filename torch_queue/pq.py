@@ -31,7 +31,6 @@ def make_path(index):
     """
     order = "{0:b}".format(index + 1)
     order = torch.tensor(list(map(int, order)))
-    print(order)
     out = [1]
     for i in range(1, len(order)):
         out.append(order[i] + 2 * out[-1])
@@ -76,7 +75,7 @@ class Heap:
         items = keys
         if not sorted:
             items, order = torch.sort(items, dim=-1)
-            values = values[:, order]
+            values = values.gather(-1, order)
         self.insert_heapify(items, values, 0, make_path(self.size))
         self.size = self.size + 1
 
@@ -148,15 +147,12 @@ def test_sort(ls):
         x = torch.tensor([l[i * group : (i + 1) * group] for l in ls]).float()
         x, _ = x.sort(dim=-1)
         x = x.view(batch, group)
-        print(x)
         heap.insert(x, x.long())
-        print(heap.storage)
     ks, vs = [], []
     for j in range(size // group):
         k, v = heap.delete_min()
         ks.append(k)
         vs.append(v)
-    print(ks)
     for b in range(batch):
         ls = []
         lsv = []
@@ -206,4 +202,3 @@ def test_path():
     assert make_path(3).tolist() == [0, 1, 3]
     assert make_path(4).tolist() == [0, 1, 4]
     assert make_path(5).tolist() == [0, 2, 5]
-    assert(False)
